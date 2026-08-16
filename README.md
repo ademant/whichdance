@@ -77,6 +77,17 @@ playlists are imported, `--limit-per-playlist 5` for a quick test run
 first, `--keep-audio` to retain the downloaded files under
 `data/raw/funkwhale/` instead of discarding them.
 
+**Faster: read audio directly instead of downloading it.** If you have
+filesystem access to the Funkwhale server's media directory (e.g. via
+`sshfs user@host:/var/www/funkwhale/data/media/music /mnt/funkwhale-media`),
+pass `--media-root /mnt/funkwhale-media` (or set `FUNKWHALE_MEDIA_ROOT` in
+`.env`). The importer builds a normalized filename index of that directory
+(tolerating accents, punctuation, and track-number prefixes like `05 - `)
+and reads matched tracks straight off disk — skipping the HTTP download
+entirely. Any track it can't match locally falls back to the normal
+download automatically, so this is safe to use even if the mount doesn't
+cover everything.
+
 This writes `data/labels.csv` directly — skip to step 2 (split).
 
 ## 2. Split

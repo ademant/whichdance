@@ -28,7 +28,9 @@ import argparse
 import csv
 import hashlib
 import os
+import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Iterable, Iterator
 from urllib.parse import urljoin
@@ -58,6 +60,70 @@ MIME_TO_EXT = {
     "audio/wav": ".wav",
     "audio/x-wav": ".wav",
 }
+
+AUDIO_EXTENSIONS = {".ogg", ".mp3", ".flac", ".opus", ".wav", ".m4a", ".aac", ".wma"}
+
+
+_LEADING_TRACK_NUMBER = re.compile(r"^\s*\d{1,3}[\s.\-_)]+")
+
+
+def _normalize(s: str) -> str:
+    """Fold to lowercase ascii alnum-only, for fuzzy filename matching that
+    tolerates accents/punctuation/spacing differences between the API's
+    track title and however Funkwhale (or the original uploader) named the
+    file on disk."""
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _strip_track_number(stem: str) -> str:
+    """Drop a leading track-number prefix, e.g. "05 - Title" -> "Title"."""
+    return _LEADING_TRACK_NUMBER.sub("", stem)
+
+
+class MediaIndex:
+    """Maps a normalized track title to local file path(s), built by
+    walking a local directory (e.g. an sshfs mount of Funkwhale's
+    media/music folder laid out as artist/album/track). Lets the importer
+    read audio straight off disk instead of downloading over HTTP.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self._by_title: dict[str, list[Path]] = {}
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                key = _normalize(_strip_track_number(path.stem))
+                self._by_title.setdefault(key, []).append(path)
+
+    def __len__(self) -> int:
+        return sum(len(v) for v in self._by_title.values())
+
+    def find(self, title: str, artist: str | None = None) -> Path | None:
+        title_key = _normalize(title)
+        candidates = self._by_title.get(title_key)
+
+        if not candidates:
+            # Fall back to substring matching (handles subtitle/edition
+            # differences the exact key missed), only scanning on a miss
+            # since it's O(n) over the index.
+            candidates = [
+                paths[0]
+                for key, paths in self._by_title.items()
+                if title_key and (title_key in key or key in title_key)
+            ]
+
+        if not candidates:
+            return None
+        if len(candidates) == 1 or not artist:
+            return candidates[0]
+
+        artist_key = _normalize(artist)
+        for c in candidates:
+            if artist_key in _normalize(str(c.parent)):
+                return c
+        return candidates[0]  # ambiguous: title matched, artist didn't disambiguate
 
 
 def _session() -> requests.Session:
@@ -160,12 +226,20 @@ def cache_path_for(track_id: int) -> Path:
     return config.PROCESSED_DIR / f"{digest}.pt"
 
 
+def _track_artist_name(track: dict) -> str | None:
+    credits = track.get("artist_credit") or []
+    if not credits:
+        return None
+    return credits[0].get("credit") or (credits[0].get("artist") or {}).get("name")
+
+
 def import_all(
     out_csv: str,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
     keep_audio: bool = False,
     limit_per_playlist: int | None = None,
+    media_root: str | None = None,
 ) -> None:
     base_url = _base_url()
     session = _session()
@@ -174,10 +248,17 @@ def import_all(
     if keep_audio:
         raw_dir.mkdir(parents=True, exist_ok=True)
 
+    media_index = None
+    if media_root:
+        print(f"indexing local media root {media_root} ...")
+        media_index = MediaIndex(Path(media_root))
+        print(f"indexed {len(media_index)} audio file(s)")
+
     playlists = list_playlists(session, base_url, include, exclude)
     print(f"found {len(playlists)} playlist(s): {[p['name'] for p in playlists]}")
 
     rows = []
+    local_hits, downloads = 0, 0
     for playlist in playlists:
         label = sanitize_label(playlist["name"])
         tracks = list(list_playlist_tracks(session, base_url, playlist["uuid"]))
@@ -191,19 +272,33 @@ def import_all(
             filepath_field = f"funkwhale:{track_id}"
 
             if not cache_path.exists():
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    audio_path = download_track(
-                        session, base_url, track, Path(tmp_dir), str(track_id)
-                    )
-                    if audio_path is None:
-                        print(f"  skip (no upload): {track.get('title')!r}")
-                        continue
-                    features = audio_file_to_features(str(audio_path))
+                local_path = (
+                    media_index.find(track["title"], _track_artist_name(track))
+                    if media_index
+                    else None
+                )
+                if local_path is not None:
+                    local_hits += 1
+                    features = audio_file_to_features(str(local_path))
                     torch.save(features, cache_path)
-                    if keep_audio:
-                        audio_path.rename(raw_dir / audio_path.name)
+                else:
+                    downloads += 1
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        audio_path = download_track(
+                            session, base_url, track, Path(tmp_dir), str(track_id)
+                        )
+                        if audio_path is None:
+                            print(f"  skip (no upload): {track.get('title')!r}")
+                            continue
+                        features = audio_file_to_features(str(audio_path))
+                        torch.save(features, cache_path)
+                        if keep_audio:
+                            audio_path.rename(raw_dir / audio_path.name)
 
             rows.append({"filepath": filepath_field, "label": label})
+
+    if media_index:
+        print(f"read locally: {local_hits}, downloaded: {downloads}")
 
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,9 +325,22 @@ def main() -> None:
         default=None,
         help="cap tracks per playlist, useful for a quick test run",
     )
+    parser.add_argument(
+        "--media-root",
+        default=os.environ.get("FUNKWHALE_MEDIA_ROOT"),
+        help="local directory (e.g. an sshfs mount of Funkwhale's media/music "
+        "folder, laid out as artist/album/track) to read audio from directly "
+        "instead of downloading over HTTP. Falls back to download per-track "
+        "if a match isn't found. Also settable via FUNKWHALE_MEDIA_ROOT.",
+    )
     args = parser.parse_args()
     import_all(
-        args.out, args.include, args.exclude, args.keep_audio, args.limit_per_playlist
+        args.out,
+        args.include,
+        args.exclude,
+        args.keep_audio,
+        args.limit_per_playlist,
+        args.media_root,
     )
 
 
