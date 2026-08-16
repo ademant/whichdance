@@ -102,6 +102,22 @@ python -m whichdance.split --labels data/labels.csv --out data/splits
 python -m whichdance.train --splits data/splits --epochs 30
 ```
 
+**Memory:** the default `--batch-size 32` needs roughly **2GB of free RAM**
+and will get OOM-killed on anything with less — measured directly on a
+constrained VPS (3.6GB total RAM), where the default batch size crashed
+immediately while `--batch-size 4` ran stably at ~800MB RSS. The model
+itself is tiny (~1MB); the memory cost comes from activations of the CNN's
+early conv layers over the full `128 x ~1292` mel spectrogram, and it
+scales roughly linearly with batch size. If training gets killed with no
+error message (or you see `Killed` / exit code 137), drop the batch size:
+
+```bash
+python -m whichdance.train --splits data/splits --epochs 30 --batch-size 8
+```
+
+Smaller batches are slower per epoch on CPU but are the only way to avoid
+OOM on a small machine.
+
 Checkpoints and the label encoder are written to `checkpoints/`:
 
 ```
