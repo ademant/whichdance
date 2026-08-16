@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 from whichdance import config
-from whichdance.analysis import estimate_bpm, estimate_duration
+from whichdance.analysis import compute_fingerprint, estimate_bpm, estimate_duration
 from whichdance.dataset import LabelEncoder
 from whichdance.features import extract_logmel, fix_length, load_audio
 from whichdance.model import DanceCNN
@@ -24,9 +24,14 @@ from whichdance.model import DanceCNN
 
 @dataclass
 class Prediction:
-    top_labels: list[tuple[str, float]]  # (label, probability), sorted desc
+    filename: str
+    fingerprint: str | None  # Chromaprint acoustic fingerprint, None if unavailable
+    guessed_dances: list[dict]  # [{"label": ..., "probability": ...}, ...], sorted desc
     bpm: float
     duration_seconds: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 def load_model(checkpoint_dir: str) -> tuple[DanceCNN, LabelEncoder, torch.device]:
@@ -58,6 +63,7 @@ def predict_with_model(
     y = load_audio(audio_path)
     bpm = estimate_bpm(y, config.SAMPLE_RATE)
     duration = estimate_duration(y, config.SAMPLE_RATE)
+    fingerprint = compute_fingerprint(audio_path)
 
     clipped = fix_length(y)
     features = extract_logmel(clipped).unsqueeze(0).to(device)
@@ -65,11 +71,17 @@ def predict_with_model(
         probs = F.softmax(model(features), dim=1).squeeze(0)
 
     top = torch.topk(probs, k=min(top_k, len(label_encoder)))
-    top_labels = [
-        (label_encoder.decode(idx.item()), prob.item())
+    guessed_dances = [
+        {"label": label_encoder.decode(idx.item()), "probability": prob.item()}
         for prob, idx in zip(top.values, top.indices)
     ]
-    return Prediction(top_labels=top_labels, bpm=bpm, duration_seconds=duration)
+    return Prediction(
+        filename=Path(audio_path).name,
+        fingerprint=fingerprint,
+        guessed_dances=guessed_dances,
+        bpm=bpm,
+        duration_seconds=duration,
+    )
 
 
 def predict(audio_path: str, checkpoint_dir: str, top_k: int = 3) -> Prediction:
@@ -90,11 +102,7 @@ def main() -> None:
     args = parser.parse_args()
 
     result = predict(args.audio, args.checkpoint, args.top_k)
-    print(f"tempo:    {result.bpm:.0f} bpm")
-    print(f"duration: {result.duration_seconds:.0f}s")
-    print()
-    for label, prob in result.top_labels:
-        print(f"{label:20s} {prob:.3f}")
+    print(json.dumps(result.to_dict(), indent=2))
 
 
 if __name__ == "__main__":

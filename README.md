@@ -124,6 +124,27 @@ directory over (or point `--checkpoint` at wherever you keep it) — both
 python -m whichdance.predict --audio path/to/tune.mp3 --checkpoint checkpoints/best.pt
 ```
 
+Prints a JSON result to stdout:
+
+```json
+{
+  "filename": "tune.mp3",
+  "fingerprint": "AQAAE0mUaEkSZSoAAAAAAAAA...",
+  "guessed_dances": [
+    {"label": "mazurka", "probability": 0.71},
+    {"label": "polska", "probability": 0.19}
+  ],
+  "bpm": 128.4,
+  "duration_seconds": 187.0
+}
+```
+
+`fingerprint` is a Chromaprint acoustic fingerprint (via `pyacoustid` +
+the `fpcalc` binary — install `chromaprint`/`libchromaprint-tools` if
+it's missing) identifying this exact recording, independent of file
+format/bitrate; `null` if `fpcalc` isn't available. The FastAPI service
+(below) returns this same JSON shape from `POST /predict`.
+
 ## 5. Web app
 
 Once you have a trained checkpoint, `src/whichdance/app.py` exposes it over
@@ -134,8 +155,8 @@ uvicorn whichdance.app:app --host 127.0.0.1 --port 8000
 ```
 
 - `GET /health` — reports whether a model is loaded
-- `POST /predict` (multipart `file=`) — returns top-k dance labels + BPM +
-  duration as JSON
+- `POST /predict` (multipart `file=`) — returns the same JSON shape as the
+  CLI above (filename, fingerprint, guessed dances, BPM, duration)
 - `GET /` — serves `static/index.html`, a bare-bones test page (upload a
   file, see the result) for exercising the API directly without WordPress
 

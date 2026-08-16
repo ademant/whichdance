@@ -30,6 +30,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -37,7 +38,9 @@ from urllib.parse import urljoin
 
 import requests
 import torch
+from requests.adapters import HTTPAdapter
 from tqdm import tqdm
+from urllib3.util import Retry
 
 from whichdance import config
 from whichdance.features import audio_file_to_features
@@ -132,6 +135,19 @@ def _session() -> requests.Session:
         raise RuntimeError("Set FUNKWHALE_TOKEN in the environment (see .env.example)")
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {token}"
+
+    # The network here has shown itself to be flaky (connection resets
+    # mid-download); retry transient failures automatically rather than
+    # aborting the whole import over one bad connection.
+    retry = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
@@ -181,6 +197,9 @@ def list_playlist_tracks(
         yield entry["track"]
 
 
+DOWNLOAD_RETRIES = 4
+
+
 def download_track(
     session: requests.Session,
     base_url: str,
@@ -200,25 +219,39 @@ def download_track(
         return None
 
     full_url = urljoin(base_url + "/", listen_url.lstrip("/"))
-    resp = session.get(full_url, stream=True, timeout=60)
-    resp.raise_for_status()
 
-    # Prefer the upload's own extension/mimetype fields: the download
-    # response's Content-Type often comes back as a generic
-    # application/octet-stream regardless of the actual audio format.
-    ext = None
-    if upload and upload.get("extension"):
-        ext = f".{upload['extension']}"
-    elif upload and upload.get("mimetype"):
-        ext = MIME_TO_EXT.get(upload["mimetype"])
-    if not ext:
-        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
-        ext = MIME_TO_EXT.get(content_type, ".mp3")
-    dest = dest_dir / f"{basename}{ext}"
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1 << 16):
-            f.write(chunk)
-    return dest
+    # The adapter-level Retry only covers connect/response-setup failures.
+    # A dropped connection *mid-stream* (seen in practice on this network)
+    # surfaces while iterating chunks below, which urllib3's Retry does not
+    # catch — so retry the whole streamed download explicitly.
+    last_exc: Exception | None = None
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            resp = session.get(full_url, stream=True, timeout=60)
+            resp.raise_for_status()
+
+            # Prefer the upload's own extension/mimetype fields: the
+            # download response's Content-Type often comes back as a
+            # generic application/octet-stream regardless of the actual
+            # audio format.
+            ext = None
+            if upload and upload.get("extension"):
+                ext = f".{upload['extension']}"
+            elif upload and upload.get("mimetype"):
+                ext = MIME_TO_EXT.get(upload["mimetype"])
+            if not ext:
+                content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                ext = MIME_TO_EXT.get(content_type, ".mp3")
+            dest = dest_dir / f"{basename}{ext}"
+
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+            return dest
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            time.sleep(2**attempt)  # 1s, 2s, 4s, 8s
+    raise last_exc
 
 
 def cache_path_for(track_id: int) -> Path:
@@ -258,55 +291,68 @@ def import_all(
     print(f"found {len(playlists)} playlist(s): {[p['name'] for p in playlists]}")
 
     rows = []
-    local_hits, downloads = 0, 0
-    for playlist in playlists:
-        label = sanitize_label(playlist["name"])
-        tracks = list(list_playlist_tracks(session, base_url, playlist["uuid"]))
-        if limit_per_playlist:
-            tracks = tracks[:limit_per_playlist]
-        print(f"[{label}] {len(tracks)} track(s)")
+    local_hits, downloads, failed = 0, 0, 0
+    try:
+        for playlist in playlists:
+            label = sanitize_label(playlist["name"])
+            tracks = list(list_playlist_tracks(session, base_url, playlist["uuid"]))
+            if limit_per_playlist:
+                tracks = tracks[:limit_per_playlist]
+            print(f"[{label}] {len(tracks)} track(s)")
 
-        for track in tqdm(tracks, desc=label, leave=False):
-            track_id = track["id"]
-            cache_path = cache_path_for(track_id)
-            filepath_field = f"funkwhale:{track_id}"
+            for track in tqdm(tracks, desc=label, leave=False):
+                track_id = track["id"]
+                cache_path = cache_path_for(track_id)
+                filepath_field = f"funkwhale:{track_id}"
 
-            if not cache_path.exists():
-                local_path = (
-                    media_index.find(track["title"], _track_artist_name(track))
-                    if media_index
-                    else None
-                )
-                if local_path is not None:
-                    local_hits += 1
-                    features = audio_file_to_features(str(local_path))
-                    torch.save(features, cache_path)
-                else:
-                    downloads += 1
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        audio_path = download_track(
-                            session, base_url, track, Path(tmp_dir), str(track_id)
+                if not cache_path.exists():
+                    try:
+                        local_path = (
+                            media_index.find(track["title"], _track_artist_name(track))
+                            if media_index
+                            else None
                         )
-                        if audio_path is None:
-                            print(f"  skip (no upload): {track.get('title')!r}")
-                            continue
-                        features = audio_file_to_features(str(audio_path))
-                        torch.save(features, cache_path)
-                        if keep_audio:
-                            audio_path.rename(raw_dir / audio_path.name)
+                        if local_path is not None:
+                            local_hits += 1
+                            features = audio_file_to_features(str(local_path))
+                            torch.save(features, cache_path)
+                        else:
+                            downloads += 1
+                            with tempfile.TemporaryDirectory() as tmp_dir:
+                                audio_path = download_track(
+                                    session, base_url, track, Path(tmp_dir), str(track_id)
+                                )
+                                if audio_path is None:
+                                    print(f"  skip (no upload): {track.get('title')!r}")
+                                    continue
+                                features = audio_file_to_features(str(audio_path))
+                                torch.save(features, cache_path)
+                                if keep_audio:
+                                    audio_path.rename(raw_dir / audio_path.name)
+                    except Exception as exc:  # noqa: BLE001
+                        # One bad track (network hiccup that outlasted the
+                        # retries, a corrupt file, ...) shouldn't sink the
+                        # whole import. Log it and move on; labels.csv is
+                        # still written for everything that did succeed.
+                        failed += 1
+                        print(f"  FAILED {track.get('title')!r}: {exc}")
+                        continue
 
-            rows.append({"filepath": filepath_field, "label": label})
-
-    if media_index:
-        print(f"read locally: {local_hits}, downloaded: {downloads}")
-
-    out_path = Path(out_csv)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["filepath", "label"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"wrote {len(rows)} rows to {out_path}")
+                rows.append({"filepath": filepath_field, "label": label})
+    finally:
+        # Written even on an unexpected/unhandled crash, so a mid-run
+        # failure doesn't discard the labels for tracks already cached.
+        out_path = Path(out_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["filepath", "label"])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {len(rows)} rows to {out_path}")
+        if media_index:
+            print(f"read locally: {local_hits}, downloaded: {downloads}")
+        if failed:
+            print(f"failed (skipped): {failed}")
 
 
 def main() -> None:

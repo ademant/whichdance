@@ -11,6 +11,11 @@ from __future__ import annotations
 import numpy as np
 import librosa
 
+try:
+    import acoustid
+except ImportError:
+    acoustid = None
+
 
 def estimate_bpm(y: np.ndarray, sr: int) -> float:
     """Estimate tempo in beats per minute via librosa's beat tracker."""
@@ -22,3 +27,21 @@ def estimate_bpm(y: np.ndarray, sr: int) -> float:
 def estimate_duration(y: np.ndarray, sr: int) -> float:
     """Duration in seconds of the (already loaded) audio."""
     return len(y) / sr
+
+
+def compute_fingerprint(path: str) -> str | None:
+    """Chromaprint acoustic fingerprint of the audio file at `path`.
+
+    Identifies this exact recording (independent of file format/bitrate),
+    e.g. for spotting duplicates or cross-referencing against AcoustID.
+    Requires the `pyacoustid` package and the `fpcalc` binary (Chromaprint)
+    on PATH; returns None (rather than raising) if either is unavailable,
+    since this is a supplementary field, not required for a prediction.
+    """
+    if acoustid is None:
+        return None
+    try:
+        _duration, fingerprint = acoustid.fingerprint_file(path)
+    except acoustid.FingerprintGenerationError:
+        return None
+    return fingerprint.decode("ascii") if isinstance(fingerprint, bytes) else fingerprint

@@ -41,13 +41,15 @@ _device = None
 
 
 class PredictionResponse(BaseModel):
-    top_labels: list[tuple[str, float]]
+    filename: str
+    fingerprint: str | None
+    guessed_dances: list[dict]
     bpm: float
     duration_seconds: float
 
     @classmethod
     def from_prediction(cls, p: Prediction) -> "PredictionResponse":
-        return cls(top_labels=p.top_labels, bpm=p.bpm, duration_seconds=p.duration_seconds)
+        return cls(**p.to_dict())
 
 
 @app.on_event("startup")
@@ -93,6 +95,11 @@ async def predict_endpoint(file: UploadFile = File(...), top_k: int = 3) -> Pred
             result = predict_with_model(tmp.name, _model, _label_encoder, _device, top_k=top_k)
         except Exception as exc:  # noqa: BLE001 - surface as a clean 400, not a 500 traceback
             raise HTTPException(status_code=400, detail=f"Could not analyze audio: {exc}") from exc
+
+        # predict_with_model saw the temp file's random name; report the
+        # original uploaded filename instead, which is what the caller
+        # actually cares about.
+        result.filename = file.filename or result.filename
 
     return PredictionResponse.from_prediction(result)
 
