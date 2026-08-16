@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>whichdance</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  #result { margin-top: 1.5rem; }
+  .bar-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.25rem 0; }
+  .bar-label { width: 8rem; text-align: right; }
+  .bar-track { flex: 1; background: #eee; border-radius: 3px; height: 1rem; overflow: hidden; }
+  .bar-fill { background: #3a7; height: 100%; }
+  .meta { color: #666; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+  <h1>whichdance — smoke-test page</h1>
+  <p>Upload a tune to test the /predict endpoint directly (this page is a dev aid, not the production UI — that's the WordPress plugin).</p>
+  <input type="file" id="file" accept="audio/*">
+  <div id="result"></div>
+
+<script>
+const fileInput = document.getElementById('file');
+const resultEl = document.getElementById('result');
+// Same origin as this page by default; override if serving this file
+// separately from the API.
+const API_BASE = '';
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  resultEl.textContent = 'analyzing...';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const resp = await fetch(`${API_BASE}/predict`, { method: 'POST', body: form });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      resultEl.textContent = `Error: ${err.detail || resp.statusText}`;
+      return;
+    }
+    const data = await resp.json();
+    render(data);
+  } catch (e) {
+    resultEl.textContent = `Error: ${e}`;
+  }
+});
+
+function render(data) {
+  // Dance labels ultimately come from Funkwhale playlist names (untrusted
+  // input), so build DOM nodes rather than interpolating them into innerHTML.
+  resultEl.textContent = '';
+  const maxProb = Math.max(...data.top_labels.map(([, p]) => p));
+
+  for (const [label, prob] of data.top_labels) {
+    const pct = (prob / maxProb * 100).toFixed(0);
+
+    const row = document.createElement('div');
+    row.className = 'bar-row';
+
+    const labelEl = document.createElement('div');
+    labelEl.className = 'bar-label';
+    labelEl.textContent = label;
+
+    const track = document.createElement('div');
+    track.className = 'bar-track';
+    const fill = document.createElement('div');
+    fill.className = 'bar-fill';
+    fill.style.width = `${pct}%`;
+    track.appendChild(fill);
+
+    const pctEl = document.createElement('div');
+    pctEl.textContent = `${(prob * 100).toFixed(0)}%`;
+
+    row.append(labelEl, track, pctEl);
+    resultEl.appendChild(row);
+  }
+
+  const meta = document.createElement('p');
+  meta.className = 'meta';
+  meta.textContent = `${Math.round(data.bpm)} bpm · ${Math.round(data.duration_seconds)}s`;
+  resultEl.appendChild(meta);
+}
+</script>
+</body>
+</html>

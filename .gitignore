@@ -1,0 +1,14 @@
+.venv/
+.env
+*.swp
+__pycache__/
+*.egg-info/
+*.pyc
+data/raw/
+data/processed/
+data/splits/
+data/labels.csv
+checkpoints/
+*.pt
+.ipynb_checkpoints/
+.DS_Store

@@ -1,0 +1,38 @@
+.whichdance-widget {
+    max-width: 32rem;
+    font-family: inherit;
+}
+
+.whichdance-result {
+    margin-top: 1rem;
+}
+
+.whichdance-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.25rem 0;
+}
+
+.whichdance-bar-label {
+    width: 8rem;
+    text-align: right;
+}
+
+.whichdance-bar-track {
+    flex: 1;
+    background: #eee;
+    border-radius: 3px;
+    height: 1rem;
+    overflow: hidden;
+}
+
+.whichdance-bar-fill {
+    background: #3a7;
+    height: 100%;
+}
+
+.whichdance-meta {
+    color: #666;
+    font-size: 0.9em;
+}

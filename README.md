@@ -1,0 +1,156 @@
+# whichdance
+
+Predict which traditional folk dance a tune belongs to (e.g. waltz, polka,
+mazurka, reel, jig, schottische, ...) from audio, using a neural network
+trained on a labeled set of tunes.
+
+## Idea
+
+Traditional dance tunes are strongly characterized by tempo, meter, and
+rhythmic accent pattern. The model consumes a fixed-length log-mel
+spectrogram of each tune (or tune excerpt) and predicts a dance-type label
+via a small CNN. This is a solid baseline; swap in a CRNN or pretrained
+audio backbone later if accuracy plateaus.
+
+## Project layout
+
+```
+data/
+  raw/            # your original audio files, organized however you like
+  processed/      # cached extracted features (.pt), generated
+  splits/         # train.csv / val.csv / test.csv (filepath,label)
+  labels.csv      # template: filepath,label for the whole dataset
+src/whichdance/
+  config.py       # central hyperparameters / paths
+  features.py     # audio -> log-mel spectrogram
+  dataset.py      # PyTorch Dataset + label encoding
+  model.py        # CNN classifier
+  train.py        # training loop, CLI entrypoint
+  predict.py      # run inference on a single audio file
+  split.py        # build train/val/test splits from labels.csv
+tests/
+  test_features.py
+```
+
+## Setup
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 1. Add your data
+
+### Option A: manually
+
+Put audio files under `data/raw/` (any layout) and fill in `data/labels.csv`:
+
+```csv
+filepath,label
+raw/waltz/tune001.mp3,waltz
+raw/polka/tune002.mp3,polka
+...
+```
+
+Labels are free-text dance names; they get encoded automatically. Keep the
+label vocabulary consistent (e.g. always "mazurka", not sometimes
+"Mazurka").
+
+### Option B: import from Funkwhale
+
+If your tunes live on a Funkwhale instance, sorted into playlists named
+after the dance, `funkwhale_import.py` pulls them directly: each playlist
+becomes a label, tracks are streamed and turned into cached feature
+tensors, and (by default) the raw audio is discarded right after so a
+large library doesn't blow through disk quota.
+
+```bash
+cp .env.example .env   # fill in FUNKWHALE_URL and FUNKWHALE_TOKEN
+python -m whichdance.funkwhale_import --out data/labels.csv
+```
+
+`FUNKWHALE_TOKEN` is the OAuth access token for a Funkwhale Application
+(Settings > Applications) with read access to your library/playlists.
+
+Useful flags: `--include waltz polka` / `--exclude misc` to restrict which
+playlists are imported, `--limit-per-playlist 5` for a quick test run
+first, `--keep-audio` to retain the downloaded files under
+`data/raw/funkwhale/` instead of discarding them.
+
+This writes `data/labels.csv` directly — skip to step 2 (split).
+
+## 2. Split
+
+```bash
+python -m whichdance.split --labels data/labels.csv --out data/splits
+```
+
+## 3. Train
+
+```bash
+python -m whichdance.train --splits data/splits --epochs 30
+```
+
+Checkpoints and the label encoder are written to `checkpoints/`:
+
+```
+checkpoints/
+  best.pt              # weights from the epoch with the highest val accuracy
+  last.pt              # weights from the final epoch
+  label_encoder.json   # index <-> dance-label mapping, needed to interpret predictions
+```
+
+**`checkpoints/` is gitignored — trained weights are not part of this repo.**
+They're a local, regenerable artifact: re-run steps 1-3 above (data import →
+split → train) to reproduce them. If you retrain on a machine other than
+where you'll run predictions/the web app, copy the whole `checkpoints/`
+directory over (or point `--checkpoint` at wherever you keep it) — both
+`best.pt`/`last.pt` and `label_encoder.json` are required together.
+
+## 4. Predict
+
+```bash
+python -m whichdance.predict --audio path/to/tune.mp3 --checkpoint checkpoints/best.pt
+```
+
+## 5. Web app
+
+Once you have a trained checkpoint, `src/whichdance/app.py` exposes it over
+HTTP:
+
+```bash
+uvicorn whichdance.app:app --host 127.0.0.1 --port 8000
+```
+
+- `GET /health` — reports whether a model is loaded
+- `POST /predict` (multipart `file=`) — returns top-k dance labels + BPM +
+  duration as JSON
+- `GET /` — serves `static/index.html`, a bare-bones test page (upload a
+  file, see the result) for exercising the API directly without WordPress
+
+This service is meant to run internally (e.g. `127.0.0.1`, not exposed to
+the internet) — the WordPress plugin proxies to it server-side.
+
+### WordPress plugin
+
+`wordpress-plugin/whichdance-wp/` is a thin client: no ML runs in PHP. It
+registers a `[whichdance]` shortcode (upload widget) and a WP REST route
+(`/wp-json/whichdance/v1/predict`) that forwards uploads to the FastAPI
+service via `wp_remote_post()` — keeps the browser same-origin (no CORS)
+and the inference service off the public internet.
+
+To install: copy `wordpress-plugin/whichdance-wp/` into your WordPress
+`wp-content/plugins/` directory, activate it, then set the inference
+service URL under **Settings > whichdance**.
+
+## Notes / next steps
+
+- Start with whole-tune audio; if tunes vary a lot in length, the dataset
+  clips/pads to `config.CLIP_SECONDS` (default 30s) taken from the middle.
+- If you have thousands of tunes, this baseline (log-mel + small CNN)
+  should get you a reasonable first accuracy number quickly. Tempo/beat
+  tracking features (e.g. via `librosa.beat`) are an obvious enrichment
+  once the pipeline works end to end, since meter/tempo is highly
+  discriminative for dance type.
+- Class imbalance is likely (some dances have far more tunes than others);
+  `train.py` uses a weighted loss by default.
