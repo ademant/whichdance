@@ -14,6 +14,12 @@ from sklearn.model_selection import train_test_split
 
 from whichdance import config
 
+# A label needs at least this many examples to survive two rounds of
+# stratified splitting (train/temp, then val/test) without a class dropping
+# to zero members on one side. Below that, sklearn's train_test_split raises
+# rather than guess how to divide a single example.
+MIN_COUNT_FOR_SPLIT = 4
+
 
 def build_splits(labels_csv: str, out_dir: str) -> None:
     df = pd.read_csv(labels_csv)
@@ -21,17 +27,21 @@ def build_splits(labels_csv: str, out_dir: str) -> None:
         raise ValueError("labels.csv must have columns: filepath,label")
 
     counts = df["label"].value_counts()
-    too_rare = counts[counts < 3]
-    if not too_rare.empty:
+    rare_labels = counts[counts < MIN_COUNT_FOR_SPLIT].index
+    rare_df = df[df["label"].isin(rare_labels)]
+    common_df = df[~df["label"].isin(rare_labels)]
+
+    if not rare_df.empty:
         print(
-            "Warning: these labels have < 3 examples and may break "
-            f"stratified splitting: {too_rare.to_dict()}"
+            f"Warning: these labels have < {MIN_COUNT_FOR_SPLIT} examples, too few to "
+            "stratify into train/val/test - putting all of them into train only "
+            f"(won't appear in val/test): {counts[rare_labels].to_dict()}"
         )
 
     train_df, temp_df = train_test_split(
-        df,
+        common_df,
         test_size=config.VAL_FRACTION + config.TEST_FRACTION,
-        stratify=df["label"],
+        stratify=common_df["label"],
         random_state=config.RANDOM_SEED,
     )
     rel_test = config.TEST_FRACTION / (config.VAL_FRACTION + config.TEST_FRACTION)
@@ -41,6 +51,8 @@ def build_splits(labels_csv: str, out_dir: str) -> None:
         stratify=temp_df["label"],
         random_state=config.RANDOM_SEED,
     )
+
+    train_df = pd.concat([train_df, rare_df], ignore_index=True)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

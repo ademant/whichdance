@@ -96,6 +96,12 @@ This writes `data/labels.csv` directly — skip to step 2 (split).
 python -m whichdance.split --labels data/labels.csv --out data/splits
 ```
 
+Labels with fewer than 4 examples can't be divided into train/val/test
+without a stratified split failing outright, so they're put entirely into
+`train.csv` (a warning is printed listing them). They'll train but won't be
+evaluated on, and the model won't be validated against them either — expect
+this for any small "misc" playlists.
+
 ## 3. Train
 
 ```bash
